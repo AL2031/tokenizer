@@ -82,12 +82,12 @@ class BPETokenizer:
             print(f"[BPE] Corpus: {len(text):,} chars  |  target vocab: {vocab_size:,}")
 
         # ── Step 1: character-level pre-tokenisation ──────────────────────
-        # Split on whitespace; mark each word's leading space with SPACE_TOKEN.
-        # Each word is stored as a tuple of single characters for easy merging.
+        # Split on whitespace; mark EVERY word with SPACE_TOKEN prefix.
+        # This includes the first word so training and encoding are identical.
         word_freq = defaultdict(int)
         for word in text.split():
             marked = self.SPACE_TOKEN + word   # "hello" -> "Ġhello"
-            word_freq[tuple(bytes(marked, "utf-8"))] += 1
+            word_freq[tuple(marked)] += 1      # ('Ġ','h','e','l','l','o')
 
         # ── Step 2: build the initial base vocabulary ─────────────────────
         # Every unique character that appears in the corpus becomes a token.
@@ -207,11 +207,12 @@ class BPETokenizer:
         """
         ids: List[int] = []
 
-        # Pre-tokenise into words, re-adding the Ġ space marker
-        for i, word in enumerate(text.split()):
-            marked = (self.SPACE_TOKEN if i > 0 else "") + word
-            # Start from character-level tokens, then apply merges in order
-            chars = list(marked)
+        # Every word gets the SPACE_TOKEN prefix — identical to training.
+        # This means the vocab always sees "Ġword" never a bare "word",
+        # which eliminates UNK for any character seen during training.
+        for word in text.split():
+            marked = self.SPACE_TOKEN + word   # always prefix, including first word
+            chars  = list(marked)
             tokens = self._bpe_encode_word(chars)
             for tok in tokens:
                 ids.append(self.token_to_id.get(tok, self.unk_id))
@@ -297,8 +298,10 @@ class BPETokenizer:
             tok = self.id_to_token.get(tid, self.UNK_TOKEN)
             tokens.append(tok)
 
-        # Join tokens and replace the Ġ space marker with a real space
-        text = "".join(tokens).replace(self.SPACE_TOKEN, " ").strip()
+        # Join tokens and replace the Ġ space marker with a real space.
+        # Since every word is prefixed with Ġ, the result starts with a
+        # leading space — strip it off.
+        text = "".join(tokens).replace(self.SPACE_TOKEN, " ").lstrip(" ")
         return text
 
     # ================================================================== #
