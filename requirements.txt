@@ -1,0 +1,5 @@
+# From-Scratch LLM — dependencies
+# Everything (tokenizer, model, training loop, dataset) is written from scratch.
+# Only PyTorch is required as an external dependency.
+
+torch>=2.1.0
