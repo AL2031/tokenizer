@@ -87,7 +87,7 @@ class BPETokenizer:
         word_freq = defaultdict(int)
         for word in text.split():
             marked = self.SPACE_TOKEN + word   # "hello" -> "Ġhello"
-            word_freq[tuple(marked)] += 1
+            word_freq[tuple(bytes(marked, "utf-8"))] += 1
 
         # ── Step 2: build the initial base vocabulary ─────────────────────
         # Every unique character that appears in the corpus becomes a token.
