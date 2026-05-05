@@ -59,7 +59,8 @@ class BPETokenizer:
     # ================================================================== #
 
     def train(self, corpus_path: str, vocab_size: int = 4096,
-              min_frequency: int = 2, verbose: bool = True) -> None:
+              min_frequency: int = 2, verbose: bool = True,
+              max_chars: int = 5_000_000) -> None:
         """
         Train the BPE tokenizer on a plain-text corpus file.
 
@@ -69,17 +70,28 @@ class BPETokenizer:
             min_frequency: Stop merging when the best pair appears fewer than
                            this many times (early-stop for sparse corpora).
             verbose:       Print progress every 100 merges.
+            max_chars:     Max characters to read for BPE training.
+                           Caps RAM usage — 5 MB is enough for a solid vocab.
+                           The full corpus is still used for model training.
         """
         path = Path(corpus_path)
         if not path.exists():
             raise FileNotFoundError(f"Corpus not found: '{path}'")
 
-        text = path.read_text(encoding="utf-8")
+        # Read only up to max_chars — BPE only needs a representative sample.
+        # Loading a 500 MB corpus into word-frequency dicts explodes RAM.
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read(max_chars)
+
         if not text.strip():
             raise ValueError("Corpus file is empty.")
 
+        actual_size = path.stat().st_size
         if verbose:
-            print(f"[BPE] Corpus: {len(text):,} chars  |  target vocab: {vocab_size:,}")
+            if actual_size > max_chars:
+                print(f"[BPE] Large corpus: {actual_size/1e6:.0f} MB total  →  "
+                      f"sampling first {max_chars/1e6:.0f} MB for vocab building")
+            print(f"[BPE] {len(text):,} chars  |  target vocab: {vocab_size:,}")
 
         # ── Step 1: character-level pre-tokenisation ──────────────────────
         # Split on whitespace; mark EVERY word with SPACE_TOKEN prefix.
