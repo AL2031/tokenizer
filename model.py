@@ -1,449 +1,421 @@
 """
-train.py
+model.py
 --------
-Full training loop for the from-scratch GPT model.
+A GPT-style decoder-only Transformer built from scratch using only PyTorch.
+No HuggingFace models, no pre-built attention layers — every operation is
+written explicitly so you can see exactly what is happening.
 
-Optimizations applied:
-  - Mixed precision training (float16) via torch.amp — ~2x memory saving
-  - Gradient accumulation — larger effective batch without more VRAM
-  - Adaptive max_chars — tokenizer samples as much corpus as RAM allows
-  - pin_memory + prefetch DataLoader — overlaps CPU/GPU transfers
-  - Memory monitoring every N steps
-  - Gradient clipping, cosine LR schedule, AdamW, checkpointing
+Architecture:
+  Embedding (token + position)
+    └─> N x TransformerBlock
+          ├─ LayerNorm
+          ├─ CausalSelfAttention  (multi-head, with causal mask)
+          ├─ Residual connection
+          ├─ LayerNorm
+          ├─ FeedForward  (GELU activation, 4x expansion)
+          └─ Residual connection
+    └─> LayerNorm
+    └─> Linear head (projects to vocab logits)
+
+Default config targets a small but trainable model (~25 M parameters):
+  vocab_size  : from tokenizer
+  context_len : 256   (tokens per sample)
+  d_model     : 512   (embedding dimension)
+  n_heads     : 8     (attention heads)
+  n_layers    : 6     (transformer blocks)
+  d_ff        : 2048  (feed-forward hidden size)
+  dropout     : 0.1
 
 Usage:
-    python train.py --corpus corpus.txt --save_dir checkpoints
+    from model import GPTConfig, GPT
 
-    # With mixed precision + gradient accumulation:
-    python train.py --corpus corpus.txt --mixed_precision --grad_accum 4
+    cfg   = GPTConfig(vocab_size=4096)
+    model = GPT(cfg)
+    print(model.num_parameters())
 """
 
-import argparse
-import csv
-import json
 import math
-import os
-import sys
-import time
-from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.amp import autocast, GradScaler
-
-from tokenizer import BPETokenizer
-from model     import GPT, GPTConfig
-from dataset   import TextDataset, build_dataloader
+import torch.nn.functional as F
 
 
 # ============================================================================
-# Adaptive RAM helper
+# Configuration dataclass
 # ============================================================================
 
-def get_adaptive_max_chars(fallback: int = 5_000_000) -> int:
-    """
-    Set max_chars for tokenizer training to 80% of available RAM.
-    Falls back to 5 MB if psutil is not installed.
-    """
-    try:
-        import psutil
-        available_mb = psutil.virtual_memory().available / 1e6
-        adaptive     = int(available_mb * 0.8 * 1e6)
-        result       = max(5_000_000, min(adaptive, 500_000_000))
-        print(f"[RAM]  Available: {available_mb:.0f} MB  →  "
-              f"tokenizer sample: {result/1e6:.0f} MB")
-        return result
-    except ImportError:
-        return fallback
+@dataclass
+class GPTConfig:
+    """All hyper-parameters for the GPT model in one place."""
 
+    vocab_size:  int   = 4096    # set to tokenizer.vocab_size after training
+    context_len: int   = 256     # maximum sequence length (context window)
+    d_model:     int   = 512     # embedding / residual stream dimension
+    n_heads:     int   = 8       # number of attention heads
+    n_layers:    int   = 6       # number of transformer blocks
+    d_ff:        int   = 2048    # feed-forward hidden dimension (usually 4 * d_model)
+    dropout:     float = 0.1     # applied after attention, FF, and embeddings
+    bias:        bool  = True    # use bias in Linear and LayerNorm layers
 
-# ============================================================================
-# Memory monitor
-# ============================================================================
-
-def print_memory_stats(device: torch.device) -> None:
-    """Print current VRAM and RAM usage."""
-    if device.type == "cuda":
-        vram_used  = torch.cuda.memory_allocated(device) / 1e9
-        vram_total = torch.cuda.get_device_properties(device).total_memory / 1e9
-        print(f"  [MEM] VRAM {vram_used:.2f}/{vram_total:.1f} GB", end="")
-    try:
-        import psutil
-        ram = psutil.Process().memory_info().rss / 1e9
-        print(f"  RAM {ram:.2f} GB", end="")
-    except ImportError:
-        pass
-    print()
-
-
-# ============================================================================
-# Learning rate schedule
-# ============================================================================
-
-def get_lr(step: int, warmup_steps: int, max_steps: int,
-           max_lr: float, min_lr: float) -> float:
-    """Linear warmup then cosine decay."""
-    if step < warmup_steps:
-        return max_lr * step / warmup_steps
-    if step >= max_steps:
-        return min_lr
-    progress = (step - warmup_steps) / (max_steps - warmup_steps)
-    return min_lr + 0.5 * (1 + math.cos(math.pi * progress)) * (max_lr - min_lr)
-
-
-# ============================================================================
-# Checkpoint helpers
-# ============================================================================
-
-def save_checkpoint(save_dir, step, model, optimizer, scaler, val_loss, cfg_dict):
-    save_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = save_dir / f"ckpt_{step:07d}.pt"
-    torch.save({
-        "step":            step,
-        "model_state":     model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "scaler_state":    scaler.state_dict() if scaler else None,
-        "val_loss":        val_loss,
-        "cfg":             cfg_dict,
-    }, ckpt_path)
-    (save_dir / "latest.txt").write_text(str(ckpt_path))
-    print(f"[CKPT] Saved → '{ckpt_path}'  (val_loss={val_loss:.4f})")
-
-
-def load_checkpoint(save_dir, model, optimizer=None, scaler=None):
-    latest_file = save_dir / "latest.txt"
-    if not latest_file.exists():
-        return 0, float("inf")
-    ckpt_path = Path(latest_file.read_text().strip())
-    if not ckpt_path.exists():
-        return 0, float("inf")
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    model.load_state_dict(ckpt["model_state"])
-    if optimizer and "optimizer_state" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-    if scaler and ckpt.get("scaler_state"):
-        scaler.load_state_dict(ckpt["scaler_state"])
-    step     = ckpt["step"]
-    val_loss = ckpt.get("val_loss", float("inf"))
-    print(f"[CKPT] Resumed from '{ckpt_path}'  (step={step}, val_loss={val_loss:.4f})")
-    return step, val_loss
-
-
-# ============================================================================
-# Validation
-# ============================================================================
-
-@torch.no_grad()
-def evaluate(model, val_loader, device, max_batches=20, use_amp=False):
-    model.eval()
-    total = 0.0
-    n     = 0
-    for x, y in val_loader:
-        if n >= max_batches:
-            break
-        x, y = x.to(device), y.to(device)
-        with autocast(device_type=device.type, enabled=use_amp):
-            _, loss = model(x, targets=y)
-        total += loss.item()
-        n     += 1
-    model.train()
-    return total / max(n, 1)
-
-
-# ============================================================================
-# Training loop
-# ============================================================================
-
-def train(args: argparse.Namespace) -> None:
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    # ── Device ───────────────────────────────────────────────────────────
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        print(f"[DEVICE] CUDA  –  {torch.cuda.get_device_name(0)}")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("[DEVICE] MPS  –  Apple Silicon")
-    else:
-        device = torch.device("cpu")
-        print("[DEVICE] CPU")
-
-    use_amp = args.mixed_precision and device.type == "cuda"
-    if use_amp:
-        print("[AMP]  Mixed precision training enabled (float16)")
-
-    # ── Tokenizer ─────────────────────────────────────────────────────────
-    tok_path = save_dir / "tokenizer.json"
-    if tok_path.exists() and not args.retrain_tokenizer:
-        tokenizer = BPETokenizer.load(str(tok_path))
-    else:
-        print("\n[STEP 1/4] Training BPE tokenizer …")
-        # Use adaptive max_chars unless user specified one explicitly
-        max_chars = (args.tok_max_chars
-                     if args.tok_max_chars
-                     else get_adaptive_max_chars())
-        tokenizer = BPETokenizer()
-        tokenizer.train(
-            corpus_path = args.corpus,
-            vocab_size  = args.vocab_size,
-            verbose     = True,
-            max_chars   = max_chars,
+    def __post_init__(self):
+        assert self.d_model % self.n_heads == 0, (
+            f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})"
         )
-        tokenizer.save(str(tok_path))
+        self.head_dim = self.d_model // self.n_heads
 
-    # ── Datasets ──────────────────────────────────────────────────────────
-    print("\n[STEP 2/4] Building datasets …")
-    pin = (device.type == "cuda")
 
-    tok_path = str(save_dir / "tokenizer.json")
-    ds_kwargs = dict(
-        tokenizer_path = tok_path,
-        context_len    = args.context_len,
-        val_fraction   = args.val_fraction,
-        num_workers    = args.encode_workers,
-        max_dataset_mb = args.max_dataset_mb,
-        cache_dir      = str(save_dir),
-    )
-    train_ds = TextDataset(args.corpus, tokenizer, split="train", **ds_kwargs)
-    val_ds   = TextDataset(args.corpus, tokenizer, split="val",   **ds_kwargs)
+# ============================================================================
+# Building blocks
+# ============================================================================
 
-    train_loader = build_dataloader(
-        train_ds,
-        batch_size          = args.batch_size,
-        shuffle             = True,
-        num_workers         = args.loader_workers,
-        pin_memory          = pin,
-        prefetch_factor     = 2 if args.loader_workers > 0 else None,
-        persistent_workers  = args.loader_workers > 0,
-    )
-    val_loader = build_dataloader(
-        val_ds,
-        batch_size          = args.batch_size,
-        shuffle             = False,
-        num_workers         = args.loader_workers,
-        pin_memory          = pin,
-        prefetch_factor     = 2 if args.loader_workers > 0 else None,
-        persistent_workers  = args.loader_workers > 0,
-    )
+class CausalSelfAttention(nn.Module):
+    """
+    Multi-head self-attention with a causal (autoregressive) mask.
 
-    # ── Model ─────────────────────────────────────────────────────────────
-    print("\n[STEP 3/4] Building model …")
-    cfg = GPTConfig(
-        vocab_size  = tokenizer.vocab_size,
-        context_len = args.context_len,
-        d_model     = args.d_model,
-        n_heads     = args.n_heads,
-        n_layers    = args.n_layers,
-        d_ff        = args.d_ff,
-        dropout     = args.dropout,
-    )
-    model = GPT(cfg).to(device)
-    print(model)
+    Each token can only attend to itself and earlier tokens — this is what
+    makes the model generative: it cannot "see the future" during training.
 
-    # ── Optimiser ─────────────────────────────────────────────────────────
-    decay_params    = [p for n, p in model.named_parameters()
-                       if p.requires_grad and p.dim() >= 2]
-    no_decay_params = [p for n, p in model.named_parameters()
-                       if p.requires_grad and p.dim() < 2]
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": decay_params,    "weight_decay": args.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ],
-        lr=args.max_lr, betas=(0.9, 0.95), eps=1e-8,
-    )
+    The causal mask is registered as a buffer so it moves to the correct
+    device automatically with .to(device) / .cuda().
+    """
 
-    # Mixed precision scaler — no-op when use_amp=False
-    scaler = GradScaler(enabled=use_amp)
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.n_heads  = cfg.n_heads
+        self.head_dim = cfg.head_dim
+        self.d_model  = cfg.d_model
+        self.dropout  = cfg.dropout
 
-    # ── Resume ────────────────────────────────────────────────────────────
-    start_step = 0
-    best_val   = float("inf")
-    if args.resume:
-        start_step, best_val = load_checkpoint(save_dir, model, optimizer, scaler)
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(device)
+        # Single fused projection for Q, K, V — 3x more efficient than
+        # three separate Linear layers because it's one matrix multiply.
+        self.qkv_proj = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=cfg.bias)
 
-    # ── CSV log ───────────────────────────────────────────────────────────
-    log_path   = save_dir / "training_log.csv"
-    log_exists = log_path.exists() and args.resume
-    log_file   = open(log_path, "a", newline="")
-    writer     = csv.writer(log_file)
-    if not log_exists:
-        writer.writerow(["step", "train_loss", "val_loss", "lr", "tokens_per_sec"])
+        # Output projection after concatenating all heads
+        self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
 
-    cfg_dict = vars(cfg)
-    (save_dir / "model_config.json").write_text(
-        json.dumps(cfg_dict, indent=2, default=str)
-    )
+        self.attn_dropout = nn.Dropout(cfg.dropout)
+        self.resid_dropout = nn.Dropout(cfg.dropout)
 
-    # ================================================================== #
-    # Training loop                                                       #
-    # ================================================================== #
-    print(f"\n[STEP 4/4] Training for {args.max_steps:,} steps …")
-    if args.grad_accum > 1:
-        print(f"[INFO]  Gradient accumulation: {args.grad_accum} steps  "
-              f"(effective batch = {args.batch_size * args.grad_accum})")
+        # Causal mask: a lower-triangular matrix of ones.
+        # Shape: (1, 1, context_len, context_len) for broadcasting over
+        # the batch and head dimensions.
+        mask = torch.tril(torch.ones(cfg.context_len, cfg.context_len))
+        self.register_buffer("causal_mask", mask.view(1, 1, cfg.context_len, cfg.context_len))
 
-    model.train()
-    train_iter    = iter(train_loader)
-    step          = start_step
-    tokens_seen   = 0
-    t_start       = time.perf_counter()
-    accum_loss    = 0.0
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, seq_len, d_model)
 
-    optimizer.zero_grad(set_to_none=True)
+        Returns:
+            (batch, seq_len, d_model)
+        """
+        B, T, C = x.shape   # batch, seq_len, d_model
 
-    while step < args.max_steps:
+        # ── Project to Q, K, V ───────────────────────────────────────────
+        # qkv shape: (B, T, 3 * d_model)
+        qkv = self.qkv_proj(x)
 
-        # Fetch batch
+        # Split along the last dimension into three equal chunks
+        q, k, v = qkv.split(self.d_model, dim=-1)
+
+        # Reshape for multi-head attention:
+        # (B, T, d_model) -> (B, n_heads, T, head_dim)
+        def split_heads(t: torch.Tensor) -> torch.Tensor:
+            return t.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        q, k, v = split_heads(q), split_heads(k), split_heads(v)
+
+        # ── Scaled dot-product attention ──────────────────────────────────
+        # Use F.scaled_dot_product_attention (PyTorch 2.0+) which
+        # automatically uses Flash Attention when available on CUDA.
+        # Flash Attention is 2-4x faster and uses O(sqrt(N)) memory
+        # instead of O(N^2) — a huge win for long sequences.
         try:
-            x, y = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            x, y = next(train_iter)
+            # is_causal=True handles the causal mask internally (faster)
+            attended = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p = self.dropout if self.training else 0.0,
+                is_causal = True,
+            )
+        except Exception:
+            # Fallback for older PyTorch versions
+            scale   = 1.0 / math.sqrt(self.head_dim)
+            scores  = torch.matmul(q, k.transpose(-2, -1)) * scale
+            scores  = scores.masked_fill(
+                self.causal_mask[:, :, :T, :T] == 0, float("-inf")
+            )
+            weights  = F.softmax(scores, dim=-1)
+            weights  = self.attn_dropout(weights)
+            attended = torch.matmul(weights, v)
 
-        x, y = x.to(device), y.to(device)
+        # ── Merge heads ───────────────────────────────────────────────────
+        # (B, n_heads, T, head_dim) -> (B, T, d_model)
+        attended = attended.transpose(1, 2).contiguous().view(B, T, C)
 
-        # LR schedule
-        lr = get_lr(step, args.warmup_steps, args.max_steps, args.max_lr, args.min_lr)
-        for group in optimizer.param_groups:
-            group["lr"] = lr
+        return self.resid_dropout(self.out_proj(attended))
 
-        # ── Forward + backward (mixed precision) ──────────────────────────
-        with autocast(device_type=device.type, enabled=use_amp):
-            _, loss = model(x, targets=y)
-            # Scale loss for gradient accumulation
-            loss = loss / args.grad_accum
 
-        scaler.scale(loss).backward()
-        accum_loss += loss.item()
+class FeedForward(nn.Module):
+    """
+    Position-wise feed-forward network applied identically to each token.
 
-        # ── Optimizer step (every grad_accum mini-steps) ──────────────────
-        if (step + 1) % args.grad_accum == 0 or step == args.max_steps - 1:
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+    Architecture:
+        Linear(d_model -> d_ff)  +  GELU  +  Linear(d_ff -> d_model)
 
-        tokens_seen += x.numel()
-        step        += 1
+    GELU (Gaussian Error Linear Unit) is the standard activation for GPT
+    models — it is smoother than ReLU and empirically trains better.
+    """
 
-        # ── Logging ───────────────────────────────────────────────────────
-        if step % args.log_every == 0:
-            elapsed     = time.perf_counter() - t_start
-            tok_per_sec = tokens_seen / elapsed
-            train_loss  = accum_loss * args.grad_accum   # unscale for display
-            accum_loss  = 0.0
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.d_ff, bias=cfg.bias),
+            nn.GELU(),
+            nn.Linear(cfg.d_ff, cfg.d_model, bias=cfg.bias),
+            nn.Dropout(cfg.dropout),
+        )
 
-            print(f"step {step:>7,}/{args.max_steps:,}  "
-                  f"loss={train_loss:.4f}  "
-                  f"lr={lr:.2e}  "
-                  f"tok/s={tok_per_sec:,.0f}")
-            writer.writerow([step, f"{train_loss:.6f}", "", f"{lr:.6e}",
-                             f"{tok_per_sec:.1f}"])
-            log_file.flush()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
-        # ── Memory monitor ────────────────────────────────────────────────
-        if args.mem_every and step % args.mem_every == 0:
-            print_memory_stats(device)
 
-        # ── Validation ────────────────────────────────────────────────────
-        if step % args.val_every == 0:
-            val_loss = evaluate(model, val_loader, device,
-                                max_batches=args.val_batches,
-                                use_amp=use_amp)
-            print(f"  [VAL] step={step:,}  val_loss={val_loss:.4f}  "
-                  f"perplexity={math.exp(val_loss):.2f}")
-            writer.writerow([step, "", f"{val_loss:.6f}", "", ""])
-            log_file.flush()
+class TransformerBlock(nn.Module):
+    """
+    One full transformer decoder block:
 
-            save_checkpoint(save_dir, step, model, optimizer, scaler,
-                            val_loss, cfg_dict)
-            if val_loss < best_val:
-                best_val = val_loss
-                torch.save(model.state_dict(), save_dir / "best_model.pt")
-                print(f"  [BEST] val_loss={best_val:.4f}")
+        x = x + Attention(LayerNorm(x))     ← residual around attention
+        x = x + FeedForward(LayerNorm(x))   ← residual around FF
 
-    log_file.close()
-    elapsed = time.perf_counter() - t_start
-    print(f"\n[DONE] {elapsed/60:.1f} min  |  best val_loss={best_val:.4f}  "
-          f"(perplexity {math.exp(best_val):.2f})")
+    Pre-norm (LayerNorm BEFORE each sub-layer) is used here because it
+    trains more stably than the original post-norm formulation.
+    """
+
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.norm1   = nn.LayerNorm(cfg.d_model, elementwise_affine=cfg.bias)
+        self.attn    = CausalSelfAttention(cfg)
+        self.norm2   = nn.LayerNorm(cfg.d_model, elementwise_affine=cfg.bias)
+        self.ff      = FeedForward(cfg)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))   # attention sub-layer + residual
+        x = x + self.ff(self.norm2(x))     # feed-forward sub-layer + residual
+        return x
 
 
 # ============================================================================
-# CLI
+# Full GPT model
 # ============================================================================
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Train a GPT LLM from scratch.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+class GPT(nn.Module):
+    """
+    GPT-style decoder-only language model.
 
-    # Data
-    data = p.add_argument_group("Data")
-    data.add_argument("--corpus",          required=True)
-    data.add_argument("--save_dir",        default="checkpoints")
-    data.add_argument("--val_fraction",    type=float, default=0.05)
-    data.add_argument("--max_dataset_mb",  type=float, default=200.0,
-                      help="Max MB of corpus to encode for dataset. "                           "200 MB is fast and has plenty of tokens.")
+    During training:
+        logits, loss = model(input_ids, targets=shifted_input_ids)
 
-    # Tokenizer
-    tok = p.add_argument_group("Tokenizer")
-    tok.add_argument("--vocab_size",         type=int,  default=4096)
-    tok.add_argument("--retrain_tokenizer",  action="store_true")
-    tok.add_argument("--tok_max_chars",      type=int,  default=None,
-                     help="Max chars for tokenizer training. "
-                          "Default: auto-detect from available RAM.")
+    During inference:
+        logits, _ = model(input_ids)
+        next_token = sample(logits[:, -1, :])
+    """
 
-    # Model
-    arch = p.add_argument_group("Model architecture")
-    arch.add_argument("--context_len", type=int,   default=256)
-    arch.add_argument("--d_model",     type=int,   default=512)
-    arch.add_argument("--n_heads",     type=int,   default=8)
-    arch.add_argument("--n_layers",    type=int,   default=6)
-    arch.add_argument("--d_ff",        type=int,   default=2048)
-    arch.add_argument("--dropout",     type=float, default=0.1)
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.cfg = cfg
 
-    # Training
-    tr = p.add_argument_group("Training")
-    tr.add_argument("--max_steps",    type=int,   default=5000)
-    tr.add_argument("--batch_size",   type=int,   default=32)
-    tr.add_argument("--max_lr",       type=float, default=3e-4)
-    tr.add_argument("--min_lr",       type=float, default=3e-5)
-    tr.add_argument("--warmup_steps", type=int,   default=200)
-    tr.add_argument("--weight_decay", type=float, default=0.1)
-    tr.add_argument("--grad_clip",    type=float, default=1.0)
-    tr.add_argument("--grad_accum",   type=int,   default=1,
-                    help="Gradient accumulation steps. "
-                         "Effective batch = batch_size × grad_accum.")
-    tr.add_argument("--mixed_precision", action="store_true",
-                    help="Enable float16 mixed precision (CUDA only). "
-                         "~2x memory saving, faster on Tensor Core GPUs.")
+        self.transformer = nn.ModuleDict(dict(
+            # Token embedding: maps each token id to a d_model-dimensional vector
+            tok_emb  = nn.Embedding(cfg.vocab_size, cfg.d_model),
 
-    # Workers
-    wk = p.add_argument_group("Workers")
-    wk.add_argument("--encode_workers", type=int, default=4,
-                    help="CPU threads for parallel dataset encoding.")
-    wk.add_argument("--loader_workers", type=int, default=2,
-                    help="DataLoader background workers.")
+            # Position embedding: learned vector for each position 0..context_len-1
+            pos_emb  = nn.Embedding(cfg.context_len, cfg.d_model),
 
-    # Logging
-    log = p.add_argument_group("Logging")
-    log.add_argument("--log_every",   type=int, default=50)
-    log.add_argument("--val_every",   type=int, default=500)
-    log.add_argument("--val_batches", type=int, default=20)
-    log.add_argument("--mem_every",   type=int, default=None,
-                     help="Print VRAM/RAM stats every N steps. None = disabled.")
-    log.add_argument("--resume",      action="store_true")
+            drop     = nn.Dropout(cfg.dropout),
 
-    return p.parse_args()
+            # Stack of N identical transformer blocks
+            blocks   = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layers)]),
 
+            # Final layer norm before the output projection
+            norm_out = nn.LayerNorm(cfg.d_model, elementwise_affine=cfg.bias),
+        ))
 
-if __name__ == "__main__":
-    train(parse_args())
+        # Language model head: projects d_model -> vocab_size to get logits
+        # We tie the weights with the token embedding matrix — this is standard
+        # practice (Press & Wolf, 2017) and reduces parameters by ~10-20%.
+        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        self.lm_head.weight = self.transformer.tok_emb.weight   # weight tying
+
+        # Initialise weights using GPT-style scaled init
+        self.apply(self._init_weights)
+
+        # Scale down residual projections by 1/sqrt(n_layers) so that the
+        # variance of the residual stream doesn't blow up with depth.
+        for name, param in self.named_parameters():
+            if name.endswith("out_proj.weight") or name.endswith("net.2.weight"):
+                nn.init.normal_(param, mean=0.0,
+                                std=0.02 / math.sqrt(2 * cfg.n_layers))
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        """Standard GPT weight initialisation."""
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,              # (B, T)
+        targets:   Optional[torch.Tensor] = None,  # (B, T)  — shifted input_ids
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Args:
+            input_ids:  Long tensor of shape (batch, seq_len).
+            targets:    Optional long tensor of same shape.  When provided,
+                        cross-entropy loss is computed and returned.
+
+        Returns:
+            logits: (batch, seq_len, vocab_size)
+            loss:   scalar tensor if targets provided, else None
+        """
+        B, T = input_ids.shape
+        assert T <= self.cfg.context_len, (
+            f"Sequence length {T} exceeds model context_len {self.cfg.context_len}"
+        )
+
+        device = input_ids.device
+
+        # ── Embeddings ───────────────────────────────────────────────────
+        # Token embeddings: (B, T, d_model)
+        tok = self.transformer.tok_emb(input_ids)
+
+        # Position embeddings: (1, T, d_model) — broadcastable over batch
+        pos = self.transformer.pos_emb(
+            torch.arange(T, device=device).unsqueeze(0)
+        )
+
+        x = self.transformer.drop(tok + pos)
+
+        # ── Transformer blocks ───────────────────────────────────────────
+        for block in self.transformer.blocks:
+            x = block(x)
+
+        # ── Output projection ────────────────────────────────────────────
+        x      = self.transformer.norm_out(x)
+        logits = self.lm_head(x)   # (B, T, vocab_size)
+
+        # ── Loss (optional) ──────────────────────────────────────────────
+        loss = None
+        if targets is not None:
+            # Cross-entropy expects (N, C) logits and (N,) targets
+            # Flatten: (B*T, vocab_size) and (B*T,)
+            loss = F.cross_entropy(
+                logits.view(-1, self.cfg.vocab_size),
+                targets.view(-1),
+                ignore_index=-1,   # positions padded with -1 don't contribute
+            )
+
+        return logits, loss
+
+    # ================================================================== #
+    # Inference helpers                                                   #
+    # ================================================================== #
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompt_ids:          torch.Tensor,   # (1, T_prompt)
+        max_new_tokens:      int   = 200,
+        temperature:         float = 1.0,
+        top_k:               int   = 50,
+        top_p:               float = 1.0,
+        repetition_penalty:  float = 1.0,
+        eos_id:              Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Autoregressive generation: append one token at a time.
+
+        Args:
+            prompt_ids:         Starting token ids, shape (1, T).
+            max_new_tokens:     How many tokens to generate.
+            temperature:        Sampling temperature (1.0 = unchanged).
+            top_k:              Keep only top-k logits before sampling.
+            top_p:              Nucleus sampling threshold.
+            repetition_penalty: Penalise already-generated tokens (>1 = less repeat).
+            eos_id:             Stop early when this token is generated.
+
+        Returns:
+            Token id tensor of shape (1, T + max_new_tokens).
+        """
+        ids = prompt_ids.clone()
+
+        for _ in range(max_new_tokens):
+            # Truncate if the context is getting too long
+            context = ids if ids.shape[1] <= self.cfg.context_len else \
+                      ids[:, -self.cfg.context_len:]
+
+            logits, _ = self(context)
+            # Take logits for the very last position only
+            logits = logits[:, -1, :]   # (1, vocab_size)
+
+            # ── Repetition penalty ────────────────────────────────────────
+            if repetition_penalty != 1.0:
+                for token_id in ids[0].tolist():
+                    logits[0, token_id] /= repetition_penalty
+
+            # ── Temperature ───────────────────────────────────────────────
+            if temperature != 1.0:
+                logits = logits / temperature
+
+            # ── Top-k filter ──────────────────────────────────────────────
+            if top_k > 0:
+                top_vals = torch.topk(logits, min(top_k, logits.size(-1))).values
+                logits[logits < top_vals[:, -1:]] = float("-inf")
+
+            # ── Top-p (nucleus) filter ────────────────────────────────────
+            if top_p < 1.0:
+                sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+                cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                # Remove tokens whose cumulative prob exceeds top_p
+                remove = cum_probs - F.softmax(sorted_logits, dim=-1) > top_p
+                sorted_logits[remove] = float("-inf")
+                # Scatter back to original ordering
+                logits = torch.zeros_like(logits).scatter_(
+                    1, sorted_idx, sorted_logits
+                )
+
+            # ── Sample ────────────────────────────────────────────────────
+            probs    = F.softmax(logits, dim=-1)
+            next_id  = torch.multinomial(probs, num_samples=1)   # (1, 1)
+            ids      = torch.cat([ids, next_id], dim=1)
+
+            if eos_id is not None and next_id.item() == eos_id:
+                break
+
+        return ids
+
+    # ================================================================== #
+    # Utilities                                                           #
+    # ================================================================== #
+
+    def num_parameters(self, trainable_only: bool = True) -> int:
+        """Return total (or only trainable) parameter count."""
+        params = (p for p in self.parameters() if p.requires_grad or not trainable_only)
+        return sum(p.numel() for p in params)
+
+    def __repr__(self) -> str:
+        n = self.num_parameters()
+        return (
+            f"GPT(\n"
+            f"  vocab={self.cfg.vocab_size}, ctx={self.cfg.context_len}, "
+            f"  d={self.cfg.d_model}, heads={self.cfg.n_heads}, "
+            f"  layers={self.cfg.n_layers}, ff={self.cfg.d_ff}\n"
+            f"  params={n/1e6:.2f}M\n"
+            f")"
+        )
