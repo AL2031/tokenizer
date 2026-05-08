@@ -196,21 +196,17 @@ def train(args: argparse.Namespace) -> None:
     print("\n[STEP 2/4] Building datasets …")
     pin = (device.type == "cuda")
 
-    train_ds = TextDataset(
-        args.corpus, tokenizer,
-        context_len  = args.context_len,
-        split        = "train",
-        val_fraction = args.val_fraction,
-        num_workers  = args.encode_workers,
+    tok_path = str(save_dir / "tokenizer.json")
+    ds_kwargs = dict(
+        tokenizer_path = tok_path,
+        context_len    = args.context_len,
+        val_fraction   = args.val_fraction,
+        num_workers    = args.encode_workers,
+        max_dataset_mb = args.max_dataset_mb,
+        cache_dir      = str(save_dir),
     )
-    val_ds = TextDataset(
-        args.corpus, tokenizer,
-        context_len  = args.context_len,
-        split        = "val",
-        val_fraction = args.val_fraction,
-        num_workers  = args.encode_workers,
-        verbose      = True,
-    )
+    train_ds = TextDataset(args.corpus, tokenizer, split="train", **ds_kwargs)
+    val_ds   = TextDataset(args.corpus, tokenizer, split="val",   **ds_kwargs)
 
     train_loader = build_dataloader(
         train_ds,
@@ -391,9 +387,11 @@ def parse_args() -> argparse.Namespace:
 
     # Data
     data = p.add_argument_group("Data")
-    data.add_argument("--corpus",       required=True)
-    data.add_argument("--save_dir",     default="checkpoints")
-    data.add_argument("--val_fraction", type=float, default=0.05)
+    data.add_argument("--corpus",          required=True)
+    data.add_argument("--save_dir",        default="checkpoints")
+    data.add_argument("--val_fraction",    type=float, default=0.05)
+    data.add_argument("--max_dataset_mb",  type=float, default=200.0,
+                      help="Max MB of corpus to encode for dataset. "                           "200 MB is fast and has plenty of tokens.")
 
     # Tokenizer
     tok = p.add_argument_group("Tokenizer")
