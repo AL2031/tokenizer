@@ -130,22 +130,27 @@ class CausalSelfAttention(nn.Module):
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
 
         # ── Scaled dot-product attention ──────────────────────────────────
-        # scores: (B, n_heads, T, T)
-        scale  = 1.0 / math.sqrt(self.head_dim)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-
-        # Apply causal mask: positions j > i get -inf so softmax -> 0
-        scores = scores.masked_fill(
-            self.causal_mask[:, :, :T, :T] == 0,
-            float("-inf")
-        )
-
-        # Softmax over the key dimension
-        weights = F.softmax(scores, dim=-1)
-        weights = self.attn_dropout(weights)
-
-        # Weighted sum of values: (B, n_heads, T, head_dim)
-        attended = torch.matmul(weights, v)
+        # Use F.scaled_dot_product_attention (PyTorch 2.0+) which
+        # automatically uses Flash Attention when available on CUDA.
+        # Flash Attention is 2-4x faster and uses O(sqrt(N)) memory
+        # instead of O(N^2) — a huge win for long sequences.
+        try:
+            # is_causal=True handles the causal mask internally (faster)
+            attended = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p = self.dropout if self.training else 0.0,
+                is_causal = True,
+            )
+        except Exception:
+            # Fallback for older PyTorch versions
+            scale   = 1.0 / math.sqrt(self.head_dim)
+            scores  = torch.matmul(q, k.transpose(-2, -1)) * scale
+            scores  = scores.masked_fill(
+                self.causal_mask[:, :, :T, :T] == 0, float("-inf")
+            )
+            weights  = F.softmax(scores, dim=-1)
+            weights  = self.attn_dropout(weights)
+            attended = torch.matmul(weights, v)
 
         # ── Merge heads ───────────────────────────────────────────────────
         # (B, n_heads, T, head_dim) -> (B, T, d_model)
